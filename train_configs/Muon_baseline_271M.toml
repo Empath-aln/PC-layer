@@ -1,0 +1,94 @@
+# torchtitan Config.toml
+# NOTE: this toml config is a preset for 8x H100 GPUs.
+
+
+[job]
+dump_folder = "."
+workspace = "pc_layer"
+description = "PC-layer-release"
+
+[profiling]
+enable_profiling = false
+save_traces_folder = "profile_trace"
+profile_freq = 100
+
+[metrics]
+log_freq = 1
+enable_tensorboard = false
+save_tb_folder = "tb"
+enable_color_printing = true
+enable_swanlab = true
+swanlab_comment = "Muon_baseline_271M"
+
+[model]
+name = "llama2"
+flavor = "271M"
+norm_type = "fused_rmsnorm"  #[layernorm, np_layernorm, rmsnorm, fused_rmsnorm]
+tokenizer_path = "./assets/tokenizer.model"
+# for baseline ,set all pre* to be false
+# for pc_layer, set pre* to be true except precondition_qk and precondition_feature_matrix
+precondition_ffn = false
+precondition_o = false
+precondition_qk = false
+precondition_v = false
+power_iter = 10
+pc_norm_type = 'sn'           # weight normalization before preconditioning: [sn (spectral norm), none]
+pc_norm_eps = 1e-7
+pc_level = 2
+recover_w_norm = false       # whether multiplying back W norm
+learnable_gamma = false      # whether multiplying a learnable scaler gamma
+gamma_init_value = 1.0      # gamma initial value
+
+log_signal_propagation = true
+log_gradients = true
+
+[optimizer]
+name = "muon"
+lr = 4.243e-3
+
+muon_lr_adjust = "moonlight"  # moonlight | spectral_mup
+muon_coefficient_type = "simple"  # simple | quintic | polar_express | aol
+ns_steps = 5  # Newton-Schulz iteration steps (simple/quintic: 5, polar_express: 8)
+use_bf16 = true  # use bf16 in the Newton-Schulz iteration
+
+[training]
+batch_size = 8  # per-GPU batch size; total_bs = batch_size * num_gpus * grad_accumulation_steps
+seq_len = 8192
+max_norm = 1.0  # grad norm clipping
+data_parallel_degree = -1
+tensor_parallel_degree = 1
+fp8_linear = ""
+compile = false
+dataset = "fineweb"
+# Path to your tokenized dataset shards (see scripts/data/README.md to build them)
+dataset_train_path = "/path/to/tokenized/train"
+dataset_val_path = "/path/to/tokenized/val"
+grad_accumulation_steps = 5
+
+warmup_steps = 220  # lr scheduler warmup, ~1% of total steps
+steps = 22000
+val_interval = 500
+num_val_batch = 40  # typically set to num_gpus * grad_accumulation_steps
+
+lr_scheduler_type = "cosine" #"wsd" #"linear_warmup_linear_decay"  #linear_warmup_cosine_decay
+cosine_end_ratio = 0.1
+
+[experimental]
+pipeline_parallel_degree = 1
+
+[comm]
+trace_buf_size = 0  # NCCL flight recorder disabled; >0 dumps a comm trace on timeout
+
+[checkpoint]
+resume = true
+enable_checkpoint = true
+folder = "./checkpoints"
+interval_type = "steps"
+interval = 2000
+model_weights_only = false
+export_dtype = "float32"
+async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]
+
+[activation_checkpoint]
+mode = 'none'  # ['none', 'selective', 'full']
+selective_ac_option = 'op'  # 'int' = ac every positive int layer or 'op', ac based on ops policy
