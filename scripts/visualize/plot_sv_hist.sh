@@ -12,9 +12,12 @@
 #   quantile empirical quantile function: x = sv percentile (small -> large),
 #            y = sigma/sigma_max at that percentile
 #
+# Default step is the final 1B step (training.steps = 61100), i.e. the converged
+# spectrum. The step must be one with a saved checkpoint; override via STEP.
+#
 # Usage:
-#   bash plot_sv_hist.sh                       # step 1 (default)
-#   STEP=61100 bash plot_sv_hist.sh
+#   bash plot_sv_hist.sh                       # final step 61100 (default)
+#   STEP=2000 bash plot_sv_hist.sh             # an earlier saved step
 #   VIS_ROOT=other_dir bash plot_sv_hist.sh    # change the root dir
 set -ex
 
@@ -23,7 +26,7 @@ set -ex
 # This script cd's to the repo root so the relative input/output paths resolve.
 cd "$(dirname "$0")/../.." || exit 1
 
-STEP=${STEP:-1}
+STEP=${STEP:-61100}
 
 # Root dir holding the JSON inputs and the output; kept as a variable so a
 # future rename only touches this one line (or can be overridden via env).

@@ -1,5 +1,5 @@
 # torchtitan Config.toml
-# NOTE: this toml config is a preset for 64 A100 GPUs.
+# NOTE: this toml config is a preset for 8x H100 GPUs.
 
 
 [job]
@@ -84,7 +84,7 @@ resume = true
 enable_checkpoint = true
 folder = "./checkpoints"
 interval_type = "steps"
-interval = 1000
+interval = 2000
 model_weights_only = false
 export_dtype = "float32"
 async_mode = "disabled" # ["disabled", "async", "async_with_pinned_mem"]

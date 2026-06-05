@@ -31,8 +31,8 @@ bash scripts/visualize/svd_baseline_vs_pc.sh
 # 2. GMCN trend curves (global / PC blocks / non-PC blocks).
 bash scripts/visualize/plot_gmcn.sh
 
-# 3. Singular-value distribution histograms at a given step (default: step 1).
-STEP=1 bash scripts/visualize/plot_sv_hist.sh
+# 3. Singular-value distribution histograms at a given step (default: final step 61100).
+bash scripts/visualize/plot_sv_hist.sh
 ```
 
 Outputs land under `visualization_output/` (git-ignored). To adapt the scripts

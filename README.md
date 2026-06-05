@@ -1,4 +1,6 @@
-# PC-Layer-torchtitan
+# PC Layer: Polynomial Weight Preconditioning for Improving LLM Pre-Training
+
+This repository accompanies the paper [PC Layer: Polynomial Weight Preconditioning for Improving LLM Pre-Training](https://arxiv.org/abs/2606.06470).
 
 This project is based on an earlier version of [torchtitan](https://github.com/pytorch/torchtitan) and has since diverged significantly. It is maintained as a standalone repository rather than a fork.
 

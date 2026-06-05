@@ -52,7 +52,7 @@ ns_steps = 5  # Newton-Schulz iteration steps (simple/quintic: 5, polar_express:
 use_bf16 = true  # use bf16 in the Newton-Schulz iteration
 
 [training]
-batch_size = 4  # per-GPU batch size; total_bs = batch_size * num_gpus * grad_accumulation_steps
+batch_size = 8  # per-GPU batch size; total_bs = batch_size * num_gpus * grad_accumulation_steps
 seq_len = 8192
 max_norm = 1.0  # grad norm clipping
 data_parallel_degree = -1
@@ -63,12 +63,12 @@ dataset = "fineweb"
 # Path to your tokenized dataset shards (see scripts/data/README.md to build them)
 dataset_train_path = "/path/to/tokenized/train"
 dataset_val_path = "/path/to/tokenized/val"
-grad_accumulation_steps = 10
+grad_accumulation_steps = 5
 
 warmup_steps = 220  # lr scheduler warmup, ~1% of total steps
 steps = 22000
 val_interval = 500
-num_val_batch = 80  # typically set to num_gpus * grad_accumulation_steps
+num_val_batch = 40  # typically set to num_gpus * grad_accumulation_steps
 
 lr_scheduler_type = "cosine" #"wsd" #"linear_warmup_linear_decay"  #linear_warmup_cosine_decay
 cosine_end_ratio = 0.1
