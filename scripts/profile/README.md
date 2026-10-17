@@ -125,7 +125,8 @@ The plot omits failed cases. Checks run separately from timing; CPU snapshots
 allow reference and candidate to run sequentially on the GPU instead of holding
 two models there. Performance starts from a fresh model with the checked initial
 state. When an optimized version is requested, `pc_baseline` is automatically
-included for performance comparison. The terminal reports paired-seed speedup
+included for performance comparison unless `--no-reference-benchmark` is set.
+This option does not disable baseline correctness checks. The terminal reports paired-seed speedup
 and mean CUDA peak-memory savings relative to it.
 
 ### v2: fusion and backward storage
@@ -265,7 +266,8 @@ python scripts/profile/plot_mlp.py "$PC_CKPT_OUT/checkpoint.csv" \
   --tradeoff --band std --output "$PC_CKPT_OUT/tradeoff.png"
 ```
 
-The benchmark inserts pc_baseline automatically. In the tradeoff plot, each
+The benchmark inserts pc_baseline automatically unless `--no-reference-benchmark`
+is set, and `--resume-from` can reuse its previous timing rows. In the tradeoff plot, each
 checkpoint mode is annotated; lower and left are better. Error bars are one
 sample standard deviation across seeds by default, or seed min/max with
 `--band range`. Use one fixed shape/accumulation count for the clearest comparison.
@@ -343,6 +345,100 @@ PC versions also load the reference's exact initial gamma and SN state.
 Implementation order alternates between seeds to reduce ordering bias. A fixed
 seed reproduces data, not GPU scheduling or timing; repeated measured steps
 within each seed also capture runtime noise.
+
+## Reuse and merge results
+
+Two workflows avoid timing the old versions again:
+
+- `--no-reference-benchmark` measures only the explicitly requested versions.
+  New PC versions still run baseline forward/backward for correctness; that
+  reference work is outside performance measurement.
+- `--resume-from old.csv ...` reuses matching successful cases and writes a new
+  combined CSV containing the input results and newly measured cases. Select
+  all desired versions to fill missing cases automatically, or only a new
+  version to add it while carrying the old versions forward. A `REUSED` line
+  means no correctness test, warmup, forward/backward, or measurement ran for
+  that case. Failed selected cases are retried; the new attempt replaces the
+  matching old failure. Failures outside the requested grid are preserved.
+
+For example, add v3's three modes to the old width sweep:
+
+```bash
+python scripts/profile/benchmark_mlp.py \
+  --device cuda --dtype bfloat16 \
+  --implementation pc_v3 --no-reference-benchmark \
+  --pc-checkpoint none polynomial full \
+  --dim 512 1024 2048 --layers 2 --tokens 512 --grad-accum-steps 4 \
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 --warmup 10 --steps 50 \
+  --resume-from outputs/pc_profile/previous/width.csv \
+  --label width --output outputs/pc_profile/width_with_v3.csv
+python scripts/profile/plot_mlp.py outputs/pc_profile/width_with_v3.csv \
+  --x dim --band std --output outputs/pc_profile/width_with_v3.png
+```
+
+Replace `previous/width.csv` with the real existing CSV. If a v3 mode was already
+completed, include that CSV in `--resume-from` too; only missing cases are timed.
+The output must be a new path, so input files are never overwritten.
+
+For the four existing H200 sweeps, this Bash loop adds v3 and plots each merged
+result. Set `PC_PREVIOUS_OUT` to the directory containing the old four CSVs:
+
+```bash
+set -euo pipefail
+source ./.venv-profile/bin/activate
+PC_PREVIOUS_OUT="outputs/pc_profile/previous"
+PC_INCREMENTAL_OUT="outputs/pc_profile/incremental_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PC_INCREMENTAL_OUT"
+COMMON=(--device cuda --dtype bfloat16 --implementation pc_v3
+  --no-reference-benchmark --pc-checkpoint none polynomial full
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 --warmup 10 --steps 50)
+for sweep in accum batch depth width; do
+  SCALE=()
+  case "$sweep" in
+    accum) GRID=(--dim 1024 --layers 2 --tokens 512 --grad-accum-steps 1 2 4 8)
+           AXIS=grad_accum_steps; SCALE=(--log-x) ;;
+    batch) GRID=(--dim 1024 --layers 2 --tokens 128 512 2048 8192 --grad-accum-steps 4)
+           AXIS=tokens; SCALE=(--log-x) ;;
+    depth) GRID=(--dim 1024 --layers 1 2 4 8 --tokens 512 --grad-accum-steps 4)
+           AXIS=layers ;;
+    width) GRID=(--dim 512 1024 2048 --layers 2 --tokens 512 --grad-accum-steps 4)
+           AXIS=dim ;;
+  esac
+  python scripts/profile/benchmark_mlp.py "${COMMON[@]}" "${GRID[@]}" \
+    --resume-from "$PC_PREVIOUS_OUT/$sweep.csv" --label "$sweep" \
+    --output "$PC_INCREMENTAL_OUT/$sweep.csv"
+  python scripts/profile/plot_mlp.py "$PC_INCREMENTAL_OUT/$sweep.csv" \
+    --x "$AXIS" "${SCALE[@]}" --band std --output "$PC_INCREMENTAL_OUT/$sweep.png"
+done
+```
+
+To merge separately measured CSVs without running torch or a GPU:
+
+```bash
+python scripts/profile/merge_mlp.py \
+  outputs/pc_profile/previous/width.csv outputs/pc_profile/width_v3_only.csv \
+  --label width --output outputs/pc_profile/width_combined.csv
+python scripts/profile/plot_mlp.py outputs/pc_profile/width_combined.csv \
+  --x dim --band std --output outputs/pc_profile/width_combined.png
+```
+
+Case identity includes implementation/reference hashes, seed, dimensions,
+accumulation, dtype, PC/checkpoint settings, warmup/measurement lengths, device
+and PyTorch/CUDA metadata, and correctness tolerances. Git commit, run ID, label,
+and source path do not affect identity. Unknown old hashes are preserved as
+unknown and do not match current hashed implementations. Missing accumulation
+and checkpoint columns mean 1 and `none`, respectively. Different identities
+remain separate; plotting separates configurations and hashes rather than
+silently pooling measurements from different environments or implementations.
+
+Identical copied rows are deduplicated. Successful results supersede matching
+failures. Repeated **different measurements of the same case/seed** are an error
+by default. Use `--on-conflict first` or `--on-conflict last` to select one
+explicitly, for both merge and resume. These refer to input file/row order, not
+timestamps. This is useful if two sweeps measured their shared central point
+independently. Duplicate measurements are never averaged or counted as extra
+seeds. All original columns are retained, with `source_csv` and `source_label`
+preserving provenance; the merged display label defaults to the output filename.
 
 ## Plot CSVs
 
@@ -426,7 +522,7 @@ separate curves when implementation names are the same but source files differ.
 Run the CPU accumulation checks from the repo root:
 
 ```bash
-python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2 scripts.profile.test_pc_v3
+python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2 scripts.profile.test_pc_v3 scripts.profile.test_profile_results
 ```
 
 These compare accumulated parameter/gamma/input gradients against a full batch,

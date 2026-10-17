@@ -34,11 +34,13 @@ CONFIG_FIELDS = (
     "pc_level", "pc_checkpoint", "power_iter", "recover_w_norm", "learnable_gamma", "warmup",
     "steps", "device", "device_name", "device_total_mib", "device_sm_count",
     "torch_version", "cuda_version",
+    "correctness_rtol", "correctness_atol",
 )
 NAMES = {
     "tokens": "N", "dim": "d", "hidden_dim": "h", "hidden_ratio": "h/d",
     "grad_accum_steps": "accum",
     "pc_checkpoint": "checkpoint",
+    "correctness_rtol": "check_rtol", "correctness_atol": "check_atol",
 }
 CHECKPOINTS = ("none", "polynomial", "full")
 
@@ -50,7 +52,8 @@ def load_rows(paths, labels=None):
             reader = csv.DictReader(handle)
             required = {"seed", "status", "label", *CONFIG_FIELDS, *(metric[0] for metric in METRICS)}
             # CSVs from before accumulation support represent accum=1.
-            for field in ("grad_accum_steps", "implementation_sha256", "reference_sha256", "pc_checkpoint"):
+            for field in ("grad_accum_steps", "implementation_sha256", "reference_sha256", "pc_checkpoint",
+                          "correctness_rtol", "correctness_atol"):
                 required.discard(field)
             missing = required - set(reader.fieldnames or [])
             if missing:
@@ -60,6 +63,8 @@ def load_rows(paths, labels=None):
                 row["implementation_sha256"] = row.get("implementation_sha256") or ""
                 row["reference_sha256"] = row.get("reference_sha256") or ""
                 row["pc_checkpoint"] = row.get("pc_checkpoint") or "none"
+                row["correctness_rtol"] = row.get("correctness_rtol") or ""
+                row["correctness_atol"] = row.get("correctness_atol") or ""
                 if row["status"] != "ok" or row.get("correctness_status") == "failed":
                     print(
                         f"Skipping {path}: {row['implementation']} seed={row['seed']} "
@@ -109,6 +114,10 @@ def curve_label(config, varying, rows):
     for field in varying:
         if field in ("source", "series", "implementation", "implementation_sha256", "reference_sha256"):
             continue
+        if field in ("correctness_rtol", "correctness_atol"):
+            settings = {row[field] for row in rows if row["implementation"] == config["implementation"]}
+            if len(settings) == 1:
+                continue
         parts.append(f"{NAMES.get(field, field)}={config[field]}")
     label = " / ".join(parts)
     sources = {row["source"] for row in rows if row["series"] == config["series"]}

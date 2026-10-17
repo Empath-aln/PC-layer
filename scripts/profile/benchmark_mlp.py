@@ -32,6 +32,9 @@ from scripts.profile.implementations import (
     REFERENCE, available_implementations, implementation_metadata, initialize_model,
     load_implementation,
 )
+from scripts.profile.profile_results import (
+    case_key, deduplicate, output_fields, read_results, relabel, successful as reusable_result,
+)
 
 PCLinear = load_implementation(REFERENCE).PCLinear
 update_model_sn_state = load_implementation(REFERENCE).update_model_sn_state
@@ -318,6 +321,14 @@ def parse_args():
     parser.add_argument("--label", help="Experiment name for plot legends; default: CSV filename")
     parser.add_argument("--check-rtol", type=float, help="Equivalence relative tolerance: FP32 1e-4, BF16 0.02")
     parser.add_argument("--check-atol", type=float, help="Equivalence absolute tolerance: FP32 1e-5, BF16 0.002")
+    parser.add_argument(
+        "--reference-benchmark", action=argparse.BooleanOptionalAction, default=True,
+        help="Auto-include baseline timing; --no-reference-benchmark still checks correctness against it",
+    )
+    parser.add_argument("--resume-from", type=Path, nargs="+", default=[],
+                        help="Reuse compatible successful cases and carry input rows into the new output CSV")
+    parser.add_argument("--on-conflict", choices=("error", "first", "last"), default="error",
+                        help="How to select repeated measurements in --resume-from; never average duplicate seeds")
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
     parser.add_argument("--output", type=Path, default=Path(f"outputs/pc_profile/mlp_{timestamp}.csv"))
     args = parser.parse_args()
@@ -330,7 +341,7 @@ def parse_args():
         value = getattr(args, name)
         if value is not None and (not math.isfinite(value) or value < 0):
             parser.error(f"--{name.replace('_', '-')} must be finite and nonnegative")
-    if any(name not in ("plain", REFERENCE) for name in args.implementation) and REFERENCE not in args.implementation:
+    if args.reference_benchmark and any(name not in ("plain", REFERENCE) for name in args.implementation) and REFERENCE not in args.implementation:
         args.implementation.insert(0, REFERENCE)
     return args
 
@@ -389,10 +400,23 @@ def main():
     if args.output.exists():
         raise SystemExit(f"Output already exists; choose a new --output path: {args.output}")
     failed = 0
+    reused = 0
     variants = experiment_variants(args)
+    try:
+        previous_rows, previous_fields = read_results(args.resume_from)
+        cached, counts = deduplicate(previous_rows, args.on_conflict)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    cached = {key: relabel(row, metadata["label"]) for key, row in cached.items()}
+    pending_failures = {key: row for key, row in cached.items() if not reusable_result(row)}
+    if args.resume_from:
+        print(f"Loaded {len(cached)} previous cases; duplicate copies={counts['duplicates']}, "
+              f"conflicts={counts['conflicts']} (policy={args.on_conflict}).", flush=True)
     with args.output.open("x", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=FIELDS)
+        writer = csv.DictWriter(handle, fieldnames=output_fields(cached.values(), [*FIELDS, *previous_fields]))
         writer.writeheader()
+        writer.writerows(row for row in cached.values() if reusable_result(row))
+        handle.flush()
         for tokens, dim, layers, grad_accum_steps in itertools.product(
             args.tokens, args.dim, args.layers, args.grad_accum_steps,
         ):
@@ -403,9 +427,6 @@ def main():
                 order = variants if seed_index % 2 == 0 else variants[::-1]
                 for implementation, checkpoint in order:
                     case_args = argparse.Namespace(**(vars(args) | {"pc_checkpoint": checkpoint}))
-                    gc.collect()
-                    if device.type == "cuda":
-                        torch.cuda.empty_cache()
                     row = {
                         **metadata, "implementation": implementation, "seed": seed,
                         "pc_checkpoint": checkpoint,
@@ -415,7 +436,23 @@ def main():
                         "tokens": tokens, "dim": dim, "hidden_dim": hidden_dim, "layers": layers,
                         "grad_accum_steps": grad_accum_steps,
                         "effective_tokens": tokens * grad_accum_steps,
+                        "source_csv": str(args.output.resolve()), "source_label": metadata["label"],
                     }
+                    if implementation not in ("plain", REFERENCE):
+                        row["correctness_rtol"] = args.check_rtol if args.check_rtol is not None else (0.02 if args.dtype == "bfloat16" else 1e-4)
+                        row["correctness_atol"] = args.check_atol if args.check_atol is not None else (0.002 if args.dtype == "bfloat16" else 1e-5)
+                    key = case_key(row)
+                    previous = cached.get(key)
+                    if previous is not None and reusable_result(previous):
+                        results[(implementation, checkpoint)].append(previous)
+                        reused += 1
+                        print(f"REUSED {implementation} checkpoint={checkpoint} seed={seed} "
+                              f"N={tokens} d={dim} layers={layers} accum={grad_accum_steps}", flush=True)
+                        continue
+                    pending_failures.pop(key, None)
+                    gc.collect()
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
                     reference_state = None
                     try:
                         if implementation not in ("plain", REFERENCE):
@@ -456,40 +493,41 @@ def main():
                 successful = [row for row in rows if row["status"] == "ok"]
                 if not successful:
                     continue
-                values = [row["total_ms"] for row in successful]
+                values = [float(row["total_ms"]) for row in successful]
                 spread = statistics.stdev(values) if len(values) > 1 else 0.0
                 message = (
                     f"  {implementation} checkpoint={checkpoint}: total {statistics.mean(values):.3f} +/- {spread:.3f} ms "
                     f"({len(values)}/{len(args.seeds)} seeds)"
                 )
                 if device.type == "cuda":
-                    peaks = [row["peak_allocated_mib"] for row in successful]
+                    peaks = [float(row["peak_allocated_mib"]) for row in successful]
                     spread = statistics.stdev(peaks) if len(peaks) > 1 else 0.0
                     message += f", peak {statistics.mean(peaks):.1f} +/- {spread:.1f} MiB"
                 print(message, flush=True)
             reference_rows = {
-                row["seed"]: row for row in results.get((REFERENCE, "none"), []) if row["status"] == "ok"
+                int(row["seed"]): row for row in results.get((REFERENCE, "none"), []) if row["status"] == "ok"
             }
             for (implementation, checkpoint), rows in results.items():
                 if implementation in ("plain", REFERENCE):
                     continue
                 pairs = [
-                    (reference_rows[row["seed"]], row) for row in rows
-                    if row["status"] == "ok" and row["seed"] in reference_rows
+                    (reference_rows[int(row["seed"])], row) for row in rows
+                    if row["status"] == "ok" and int(row["seed"]) in reference_rows
                 ]
                 if not pairs:
                     continue
-                speedups = [reference["total_ms"] / row["total_ms"] for reference, row in pairs]
+                speedups = [float(reference["total_ms"]) / float(row["total_ms"]) for reference, row in pairs]
                 spread = statistics.stdev(speedups) if len(speedups) > 1 else 0.0
                 message = (
                     f"  {implementation} checkpoint={checkpoint} vs {REFERENCE}: "
                     f"{statistics.mean(speedups):.3f} +/- {spread:.3f}x speedup ({len(pairs)} paired seeds)"
                 )
                 if device.type == "cuda":
-                    savings = [reference["peak_allocated_mib"] - row["peak_allocated_mib"] for reference, row in pairs]
+                    savings = [float(reference["peak_allocated_mib"]) - float(row["peak_allocated_mib"]) for reference, row in pairs]
                     message += f", mean peak memory saving {statistics.mean(savings):.1f} MiB"
                 print(message, flush=True)
-    print(f"Saved {args.output}", flush=True)
+        writer.writerows(pending_failures.values())
+    print(f"Saved {args.output}; reused {reused} requested cases without measurement.", flush=True)
     if failed:
         raise SystemExit(f"{failed} case(s) failed; see status/error in the CSV.")
 
