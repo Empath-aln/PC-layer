@@ -16,7 +16,8 @@ weight, and gamma gradients. `--layers` can stack multiple MLP blocks.
 
 - `plain`: ordinary `nn.Linear` MLP, with no PC; not an equivalent PC implementation.
 - `pc_baseline`: the frozen original PC implementation in `pc_baseline.py`.
-- `pc_v1`, `pc_v2`, etc.: future versions, each in its own `pc_*.py` file here.
+- `pc_v1`: one PC transform and one PC backward per accumulated step; see below.
+- `pc_v2`, etc.: future versions, each in its own `pc_*.py` file here.
 
 `pc_baseline.py` is a byte-for-byte snapshot of
 `torchtitan/pc_layer/pc_layer.py` at commit
@@ -28,10 +29,10 @@ snapshot directly, so changing the training operator will not change the referen
 Version files are discovered automatically, without editing a registry:
 
 ```bash
-cp scripts/profile/pc_baseline.py scripts/profile/pc_v1.py
-# Edit pc_v1.py to implement the optimization.
+cp scripts/profile/pc_baseline.py scripts/profile/pc_v2.py
+# Edit pc_v2.py to implement the next optimization.
 python scripts/profile/benchmark_mlp.py \
-  --implementation pc_baseline pc_v1 --dim 512 1024 --tokens 256 \
+  --implementation pc_baseline pc_v2 --dim 512 1024 --tokens 256 \
   --grad-accum-steps 4 --seeds 0 1 2 \
   --output outputs/pc_profile/versions.csv
 python scripts/profile/plot_mlp.py outputs/pc_profile/versions.csv \
@@ -46,11 +47,67 @@ be customized by exporting `initialize_model(model)`; otherwise the harness
 zeros `sn_u`/`sn_v` and calls `_maybe_init_gamma()` on that version's PC layers.
 Do not import implementation code from the changing training operator.
 
+Versions may also export `accumulation_context(model, grad_accum_steps)`, a
+context manager around all microbatch forwards/backwards. Entry must only set up
+transient state; evaluate transforms lazily in forward so their time is measured.
+Exit must finish all deferred parameter gradients and release caches, including
+on exceptions. Exit time is included in the **last microbatch's backward**;
+SN update runs after exit. Versions without this hook keep the original behavior.
+
+### v1: reuse PC across microbatches
+
+The v1 file copies the frozen PC/SN mathematics and adds a step-scoped cache.
+For `grad_accum_steps > 1`, each PC layer computes `P = PC(W, gamma)` once on its
+first forward. The microbatches use a detached leaf sharing P's storage, and
+accumulate `g_P = sum_i d(loss_i / G)/dP`. Context exit backpropagates g_P through
+the original P graph once, producing the W and gamma gradients, including the
+spectral-normalization derivative. Ordinary MLP backward, including each input
+gradient, still runs on every microbatch and releases that activation graph.
+No microbatch uses `retain_graph=True`.
+
+Weights, gamma, and SN vectors must remain fixed inside this context. All caches
+are discarded before the SN update, and a new PC graph is built next step. At
+accum=1, and outside the context, v1 uses the baseline forward/backward path.
+The single-device benchmark supplies this context automatically; a caller that
+only invokes `model(x)` without it gets no cross-microbatch reuse. This profiling
+version does not implement distributed training or higher-order differentiation.
+
+This moves the PC backward from every microbatch to the end of the accumulated
+step. Forward/backward panels include the shared work once per step, so compare
+the **total accumulated-step time** as well. The PC graph remains live until the
+end, and the cached leaf needs a gradient buffer; peak memory may increase or
+decrease and must be measured. BF16 changes the summation order and need not be
+bitwise identical; the existing correctness tolerances are unchanged. Per-step
+equivalence is checked at identical weights/state, not identical long training
+trajectories after independently applying rounded gradients.
+
+Run this comparison on the H200 slice (five seeds, including an accum=1 control):
+
+```bash
+source ./.venv-profile/bin/activate
+PC_V1_OUT="outputs/pc_profile/pc_v1_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PC_V1_OUT"
+python scripts/profile/benchmark_mlp.py \
+  --device cuda --dtype bfloat16 \
+  --implementation plain pc_baseline pc_v1 \
+  --dim 1024 --layers 2 --tokens 512 --grad-accum-steps 1 2 4 8 \
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 \
+  --warmup 10 --steps 50 --label accum \
+  --output "$PC_V1_OUT/accum.csv"
+python scripts/profile/plot_mlp.py "$PC_V1_OUT/accum.csv" \
+  --x grad_accum_steps --log-x --band std \
+  --output "$PC_V1_OUT/accum.png"
+```
+
+For a separate FP32 check, repeat the benchmark with `--dtype float32` and a new
+output path. On either dtype, failed correctness cases are excluded from timing.
+
 Before timing each optimized `(shape, seed, accumulation)` case, the harness:
 
 1. Loads identical initial weights, gamma, SN state, input, and target.
-2. Checks every microbatch's MLP output, unscaled MSE, input gradient, every
-   parameter gradient (including gamma), across two accumulated steps.
+2. Checks every microbatch's MLP output, the final unscaled MSE and input
+   gradient, and all accumulated parameter gradients (including gamma),
+   across two accumulated steps.
 3. Checks an additional forward after the last SN update, covering stateful
    behavior as well as the polynomial transform and backward.
 
@@ -108,12 +165,14 @@ recovery, and gamma options do not affect the ordinary `plain` MLP.
 Weights stay fixed; this measures forward/loss/backward, not learning progress.
 Parameter gradients are cleared once at the start of each accumulated step.
 Each microbatch computes `MSE / grad_accum_steps` and immediately backpropagates;
-parameter gradients accumulate across microbatches and each graph is freed by
-its backward. SN state is initialized before warmup, then refreshed **once after
-all microbatches**, with its cost included in total time.
+parameter gradients accumulate across microbatches. Baseline frees each graph
+with its backward; v1 frees each activation graph immediately and retains one
+weight-transform graph until the final backward. SN state is initialized before
+warmup, then refreshed **once after all microbatches**, with its cost included in
+total time.
 There is no optimizer. Input/target generation, initial SN setup, warmup, and
 finite-gradient/equivalence checks are outside measurement. Add rewritten PC
-operators as independent version files, leaving the benchmark and reference fixed.
+operators as independent version files, keeping the reference frozen.
 
 The same fixed input/target is reused for each microbatch, as it is across
 measured steps. This keeps random generation, copies, and storage for an entire
@@ -211,9 +270,12 @@ separate curves when implementation names are the same but source files differ.
 Run the CPU accumulation checks from the repo root:
 
 ```bash
-python -m unittest scripts.profile.test_benchmark_mlp
+python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1
 ```
 
 These compare accumulated parameter/gamma/input gradients against a full batch,
 verify the frozen snapshot and timing boundaries, accept identical FP32/BF16
 versions, and reject incorrect outputs, backward gradients, and SN updates.
+The v1 tests also use distinct microbatches, change weights/gamma between steps,
+compare every input gradient, count PC forward/backward calls, verify cache
+cleanup on failure, and ensure deferred backward stays inside the timed region.

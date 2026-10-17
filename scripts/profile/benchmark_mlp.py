@@ -16,6 +16,7 @@ import statistics
 import subprocess
 import sys
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -85,6 +86,7 @@ def build_mlp(dim, hidden_dim, layers, implementation, config):
 
 def run_step(
     model, x, target, uses_pc, markers=None, grad_accum_steps=1, update_sn_state=None,
+    accumulation_context=None,
 ):
     """One accumulated step; the fixed microbatch is reused without data copies."""
     model.zero_grad(set_to_none=True)
@@ -96,20 +98,28 @@ def run_step(
             else:
                 markers[index] = time.perf_counter()
 
-    for microbatch in range(grad_accum_steps):
-        # Only parameter gradients accumulate. x stands in for a fresh input
-        # leaf on each microbatch, so retain just its most recent gradient.
-        x.grad = None
-        offset = 4 * microbatch
-        mark(offset)
-        prediction = model(x)
-        mark(offset + 1)
-        unscaled_loss = F.mse_loss(prediction.float(), target)
-        loss = unscaled_loss / grad_accum_steps if grad_accum_steps > 1 else unscaled_loss
-        del prediction
-        mark(offset + 2)
-        loss.backward()
-        mark(offset + 3)
+    # Versions may share a weight transform across microbatches and defer its
+    # backward until context exit. That work belongs to the final backward
+    # interval, before the SN state can change. Context entry only sets up state;
+    # transforms are evaluated lazily inside the measured forward.
+    context = accumulation_context(model, grad_accum_steps) if accumulation_context else nullcontext()
+    with context:
+        for microbatch in range(grad_accum_steps):
+            # Only parameter gradients accumulate. x stands in for a fresh input
+            # leaf on each microbatch, so retain just its most recent gradient.
+            x.grad = None
+            offset = 4 * microbatch
+            mark(offset)
+            prediction = model(x)
+            mark(offset + 1)
+            unscaled_loss = F.mse_loss(prediction.float(), target)
+            loss = unscaled_loss / grad_accum_steps if grad_accum_steps > 1 else unscaled_loss
+            del prediction
+            mark(offset + 2)
+            loss.backward()
+            if microbatch + 1 < grad_accum_steps:
+                mark(offset + 3)
+    mark(4 * grad_accum_steps - 1)
     mark(4 * grad_accum_steps)
     if uses_pc:
         (update_sn_state or update_model_sn_state)(model)
@@ -160,7 +170,7 @@ def make_inputs(args, seed, tokens, dim, device):
 
 def check_case(args, implementation, seed, tokens, dim, hidden_dim, layers, device, grad_accum_steps):
     reference_update = load_implementation(REFERENCE).update_model_sn_state
-    candidate_update = load_implementation(implementation).update_model_sn_state
+    candidate = load_implementation(implementation)
     rtol = args.check_rtol if args.check_rtol is not None else (0.02 if args.dtype == "bfloat16" else 1e-4)
     atol = args.check_atol if args.check_atol is not None else (0.002 if args.dtype == "bfloat16" else 1e-5)
     return check_equivalence(
@@ -171,7 +181,9 @@ def check_case(args, implementation, seed, tokens, dim, hidden_dim, layers, devi
             model, x, target, True, grad_accum_steps=grad_accum_steps, update_sn_state=reference_update,
         ),
         lambda model, x, target: run_step(
-            model, x, target, True, grad_accum_steps=grad_accum_steps, update_sn_state=candidate_update,
+            model, x, target, True, grad_accum_steps=grad_accum_steps,
+            update_sn_state=candidate.update_model_sn_state,
+            accumulation_context=getattr(candidate, "accumulation_context", None),
         ),
         rtol=rtol, atol=atol,
     )
@@ -185,9 +197,13 @@ def measure_case(
     version = load_implementation(implementation)
     uses_pc = version is not None
     updater = version.update_model_sn_state if uses_pc else None
+    accumulation_context = getattr(version, "accumulation_context", None)
     x, target = make_inputs(args, seed, tokens, dim, device)
     for _ in range(args.warmup):
-        run_step(model, x, target, uses_pc, grad_accum_steps=grad_accum_steps, update_sn_state=updater)
+        run_step(
+            model, x, target, uses_pc, grad_accum_steps=grad_accum_steps,
+            update_sn_state=updater, accumulation_context=accumulation_context,
+        )
     model.zero_grad(set_to_none=True)
     x.grad = None
 
@@ -209,7 +225,10 @@ def measure_case(
 
     wall_start = time.perf_counter()
     for step_markers in markers:
-        last_loss = run_step(model, x, target, uses_pc, step_markers, grad_accum_steps, updater)
+        last_loss = run_step(
+            model, x, target, uses_pc, step_markers, grad_accum_steps, updater,
+            accumulation_context,
+        )
     if device.type == "cuda":
         torch.cuda.synchronize(device)
     wall_ms = (time.perf_counter() - wall_start) * 1000 / args.steps
