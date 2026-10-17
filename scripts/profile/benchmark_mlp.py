@@ -45,7 +45,7 @@ FIELDS = (
     "run_id", "label", "implementation", "implementation_file", "implementation_sha256",
     "reference_implementation", "reference_sha256", "status", "error", "seed", "tokens",
     "dim", "hidden_dim", "layers", "grad_accum_steps", "effective_tokens",
-    "dtype", "pc_level", "power_iter",
+    "dtype", "pc_level", "pc_checkpoint", "power_iter",
     "recover_w_norm", "learnable_gamma", "warmup", "steps", "device",
     "device_name", "device_total_mib", "device_sm_count", "torch_version",
     "cuda_version", "git_commit", "git_dirty", "loss", "parameter_mib",
@@ -66,6 +66,7 @@ class PCConfig:
     recover_w_norm: bool = True
     learnable_gamma: bool = True
     gamma_init_value: float = 1.0
+    pc_checkpoint: str = "full"
 
 
 def build_mlp(dim, hidden_dim, layers, implementation, config):
@@ -143,6 +144,7 @@ def make_case_model(args, implementation, seed, dim, hidden_dim, layers, device,
     config = PCConfig(
         pc_level=args.pc_level, power_iter=args.power_iter,
         recover_w_norm=args.recover_w_norm, learnable_gamma=args.learnable_gamma,
+        pc_checkpoint=getattr(args, "pc_checkpoint", "full"),
     )
     model = build_mlp(dim, hidden_dim, layers, implementation, config)
     model = model.to(device=device, dtype=getattr(torch, args.dtype)).train()
@@ -304,6 +306,10 @@ def parse_args():
     parser.add_argument("--dtype", choices=("bfloat16", "float32"), default="bfloat16")
     parser.add_argument("--device", default="cuda", help="cuda, cuda:0, etc.; cpu for smoke tests")
     parser.add_argument("--pc-level", type=int, choices=range(5), default=4)
+    parser.add_argument(
+        "--pc-checkpoint", nargs="+", choices=("none", "polynomial", "full"), default=["full"],
+        help="Checkpoint modes to sweep for implementations that support it; older versions run once",
+    )
     parser.add_argument("--power-iter", type=positive_int, default=10)
     parser.add_argument("--recover-w-norm", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--learnable-gamma", action=argparse.BooleanOptionalAction, default=True)
@@ -317,7 +323,7 @@ def parse_args():
     args = parser.parse_args()
     if len(set(args.seeds)) != len(args.seeds) or any(seed < 0 or seed >= 2**63 - 1 for seed in args.seeds):
         parser.error("--seeds must be distinct integers in [0, 2**63 - 2]")
-    for name in ("tokens", "dim", "layers", "grad_accum_steps", "implementation"):
+    for name in ("tokens", "dim", "layers", "grad_accum_steps", "implementation", "pc_checkpoint"):
         if len(set(getattr(args, name))) != len(getattr(args, name)):
             parser.error(f"--{name.replace('_', '-')} must not contain duplicates")
     for name in ("check_rtol", "check_atol"):
@@ -336,6 +342,18 @@ def git_value(*arguments):
         ).strip()
     except (OSError, subprocess.CalledProcessError):
         return "unknown"
+
+
+def experiment_variants(args):
+    variants = []
+    for implementation in args.implementation:
+        supported = getattr(load_implementation(implementation), "CHECKPOINT_MODES", ())
+        modes = args.pc_checkpoint if supported else ("none",)
+        for mode in modes:
+            if supported and mode not in supported:
+                raise ValueError(f"{implementation} does not support checkpoint mode {mode}")
+            variants.append((implementation, mode))
+    return variants
 
 
 def main():
@@ -371,6 +389,7 @@ def main():
     if args.output.exists():
         raise SystemExit(f"Output already exists; choose a new --output path: {args.output}")
     failed = 0
+    variants = experiment_variants(args)
     with args.output.open("x", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=FIELDS)
         writer.writeheader()
@@ -378,16 +397,18 @@ def main():
             args.tokens, args.dim, args.layers, args.grad_accum_steps,
         ):
             hidden_dim = args.hidden_dim or 4 * dim
-            results = {name: [] for name in args.implementation}
+            results = {variant: [] for variant in variants}
             for seed_index, seed in enumerate(args.seeds):
                 # Alternate the paired order to reduce systematic ordering bias.
-                order = args.implementation if seed_index % 2 == 0 else args.implementation[::-1]
-                for implementation in order:
+                order = variants if seed_index % 2 == 0 else variants[::-1]
+                for implementation, checkpoint in order:
+                    case_args = argparse.Namespace(**(vars(args) | {"pc_checkpoint": checkpoint}))
                     gc.collect()
                     if device.type == "cuda":
                         torch.cuda.empty_cache()
                     row = {
                         **metadata, "implementation": implementation, "seed": seed,
+                        "pc_checkpoint": checkpoint,
                         **implementation_metadata(implementation),
                         "reference_implementation": REFERENCE if implementation != "plain" else "",
                         "correctness_status": "not_applicable" if implementation == "plain" else "reference",
@@ -399,7 +420,7 @@ def main():
                     try:
                         if implementation not in ("plain", REFERENCE):
                             check, reference_state = check_case(
-                                args, implementation, seed, tokens, dim, hidden_dim, layers, device, grad_accum_steps,
+                                case_args, implementation, seed, tokens, dim, hidden_dim, layers, device, grad_accum_steps,
                             )
                             row.update(check)
                             gc.collect()
@@ -409,7 +430,7 @@ def main():
                             row.update(status="correctness_failed", error=row["correctness_error"])
                         else:
                             row.update(measure_case(
-                                args, implementation, seed, tokens, dim, hidden_dim, layers, device,
+                                case_args, implementation, seed, tokens, dim, hidden_dim, layers, device,
                                 grad_accum_steps, reference_state,
                             ))
                     except torch.cuda.OutOfMemoryError as error:
@@ -417,12 +438,12 @@ def main():
                     del reference_state
                     writer.writerow(row)
                     handle.flush()
-                    results[implementation].append(row)
+                    results[(implementation, checkpoint)].append(row)
                     failed += row["status"] != "ok"
                     print(
                         f"{implementation:8s} seed={seed} N={tokens} d={dim} "
                         f"h={hidden_dim} layers={layers} accum={grad_accum_steps}: "
-                        f"{row['status']}", flush=True,
+                        f"checkpoint={checkpoint} {row['status']}", flush=True,
                     )
                     if row.get("correctness_status") in ("passed", "failed"):
                         print(
@@ -431,14 +452,14 @@ def main():
                             f"max_rel={row['correctness_max_rel_error']:.3g}) "
                             f"{row.get('correctness_error', '')}", flush=True,
                         )
-            for implementation, rows in results.items():
+            for (implementation, checkpoint), rows in results.items():
                 successful = [row for row in rows if row["status"] == "ok"]
                 if not successful:
                     continue
                 values = [row["total_ms"] for row in successful]
                 spread = statistics.stdev(values) if len(values) > 1 else 0.0
                 message = (
-                    f"  {implementation}: total {statistics.mean(values):.3f} +/- {spread:.3f} ms "
+                    f"  {implementation} checkpoint={checkpoint}: total {statistics.mean(values):.3f} +/- {spread:.3f} ms "
                     f"({len(values)}/{len(args.seeds)} seeds)"
                 )
                 if device.type == "cuda":
@@ -447,9 +468,9 @@ def main():
                     message += f", peak {statistics.mean(peaks):.1f} +/- {spread:.1f} MiB"
                 print(message, flush=True)
             reference_rows = {
-                row["seed"]: row for row in results.get(REFERENCE, []) if row["status"] == "ok"
+                row["seed"]: row for row in results.get((REFERENCE, "none"), []) if row["status"] == "ok"
             }
-            for implementation, rows in results.items():
+            for (implementation, checkpoint), rows in results.items():
                 if implementation in ("plain", REFERENCE):
                     continue
                 pairs = [
@@ -461,7 +482,7 @@ def main():
                 speedups = [reference["total_ms"] / row["total_ms"] for reference, row in pairs]
                 spread = statistics.stdev(speedups) if len(speedups) > 1 else 0.0
                 message = (
-                    f"  {implementation} vs {REFERENCE}: "
+                    f"  {implementation} checkpoint={checkpoint} vs {REFERENCE}: "
                     f"{statistics.mean(speedups):.3f} +/- {spread:.3f}x speedup ({len(pairs)} paired seeds)"
                 )
                 if device.type == "cuda":

@@ -18,7 +18,8 @@ weight, and gamma gradients. `--layers` can stack multiple MLP blocks.
 - `pc_baseline`: the frozen original PC implementation in `pc_baseline.py`.
 - `pc_v1`: one PC transform and one PC backward per accumulated step; see below.
 - `pc_v2`: v1's accumulation plus CUDA fusion and a smaller backward saved set.
-- `pc_v3`, etc.: future versions, each in its own `pc_*.py` file here.
+- `pc_v3`: v2 with selectable PC checkpointing (`none`, `polynomial`, `full`).
+- `pc_v4`, etc.: future versions, each in its own `pc_*.py` file here.
 
 `pc_baseline.py` is a byte-for-byte snapshot of
 `torchtitan/pc_layer/pc_layer.py` at commit
@@ -30,10 +31,10 @@ snapshot directly, so changing the training operator will not change the referen
 Version files are discovered automatically, without editing a registry:
 
 ```bash
-cp scripts/profile/pc_v2.py scripts/profile/pc_v3.py
-# Edit pc_v3.py to implement the next optimization.
+cp scripts/profile/pc_v3.py scripts/profile/pc_v4.py
+# Edit pc_v4.py to implement the next optimization.
 python scripts/profile/benchmark_mlp.py \
-  --implementation pc_baseline pc_v2 pc_v3 --dim 512 1024 --tokens 256 \
+  --implementation pc_baseline pc_v3 pc_v4 --dim 512 1024 --tokens 256 \
   --grad-accum-steps 4 --seeds 0 1 2 \
   --output outputs/pc_profile/versions.csv
 python scripts/profile/plot_mlp.py outputs/pc_profile/versions.csv \
@@ -201,6 +202,86 @@ python scripts/profile/plot_mlp.py "$PC_V2_OUT/accum.csv" \
   --x grad_accum_steps --log-x --band std --output "$PC_V2_OUT/accum.png"
 ~~~
 
+### v3: PC checkpointing and the time/memory tradeoff
+
+`pc_v3.py` is a standalone copy of v2 with operator-local recomputation inside
+its manual backward. It preserves the norm's stop-gradient on recovery, gamma=0
+derivatives, and the order of dtype rounding. It does not checkpoint MLP
+activations. The existing accumulation context and timing boundaries apply;
+recomputation runs once per PC backward in the accumulated step and is included
+in the backward and total panels. No training-loop changes are needed.
+
+For level 4, trainable W/norm/gamma, d=1024, h=4096, and BF16:
+
+| `--pc-checkpoint` | New saved PC intermediates per PCLinear | Forward GEMMs | Backward GEMMs |
+| --- | --- | --- | --- |
+| `none` | R + Gram + 3 Horner results: 16 MiB, same as v2 | 5 | 10 |
+| `polynomial` | R + Gram: 10 MiB | 5 | 13 |
+| `full` | None; save original W/norm/gamma references | 5 | 15 |
+
+The modes respectively avoid recomputation, rebuild the three Horner products,
+or also rebuild Gram and the pre-gamma output R. Frozen gamma avoids the extra R
+GEMM in full mode. Level 0 needs no GEMMs in any mode. These counts describe the
+PC operator, excluding activation matmuls and SN vector operations. Saved sizes
+exclude the output P, its accumulated gradient, original inputs/shared storage,
+and backward temporaries. Across four PCLinear projections in two blocks, the
+saved set is 64 / 40 / 0 MiB; those differences are **not promised peak savings**.
+
+`--pc-checkpoint` accepts multiple modes and defaults to `full` for v3. Earlier
+versions ignore this option and are measured only once per shape/seed; their CSV
+mode is `none`. Each mode is checked independently against the frozen baseline
+at the unchanged tolerances before timing. BF16 accumulation/manual-VJP rounding
+can fail the existing strict gate for some shapes, including without checkpointing;
+failed cases remain failed and are excluded from performance comparisons.
+
+Start with a fixed shape on H200 to inspect the tradeoff:
+
+```bash
+set -euo pipefail
+source ./.venv-profile/bin/activate
+python - <<'PY'
+import torch, triton
+assert torch.cuda.is_available(), "CUDA is required; do not silently skip GPU checks"
+print(torch.__version__, triton.__version__, torch.cuda.get_device_name())
+PY
+python -m unittest scripts.profile.test_pc_v3 -v
+
+PC_CKPT_OUT="outputs/pc_profile/pc_v3_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PC_CKPT_OUT"
+python scripts/profile/benchmark_mlp.py \
+  --device cuda --dtype bfloat16 \
+  --implementation plain pc_v2 pc_v3 \
+  --pc-checkpoint none polynomial full \
+  --dim 1024 --layers 2 --tokens 512 --grad-accum-steps 4 \
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 \
+  --warmup 10 --steps 50 --label checkpoint \
+  --output "$PC_CKPT_OUT/checkpoint.csv"
+
+# Original six panels, with checkpoint mode as the x axis.
+python scripts/profile/plot_mlp.py "$PC_CKPT_OUT/checkpoint.csv" \
+  --x pc_checkpoint --band std --output "$PC_CKPT_OUT/phases.png"
+# Cross-seed mean step time vs peak CUDA memory; both axes show seed intervals.
+python scripts/profile/plot_mlp.py "$PC_CKPT_OUT/checkpoint.csv" \
+  --tradeoff --band std --output "$PC_CKPT_OUT/tradeoff.png"
+```
+
+The benchmark inserts pc_baseline automatically. In the tradeoff plot, each
+checkpoint mode is annotated; lower and left are better. Error bars are one
+sample standard deviation across seeds by default, or seed min/max with
+`--band range`. Use one fixed shape/accumulation count for the clearest comparison.
+The four existing sweeps work with the same mode list: use accumulation 1/2/4/8,
+tokens 128/512/2048/8192, layers 1/2/4/8, or dim 512/1024/2048 and keep the other
+dimensions fixed as before. Their six-panel plots separate checkpoint modes
+into distinct curves. Old CSVs without the mode column are read as `none`.
+
+CPU checks cover FP32/BF16, tall/wide/square matrices, all PC levels, frozen
+inputs, noncontiguous weights, gamma edge cases, finite differences, distinct
+microbatches and changed weights, saved storage, and GEMM counts. The two v3 CUDA
+checks cover the recomputation kernels and the full benchmark correctness gate;
+they skip locally without CUDA. Actual H200 timing/peak memory is not measured
+on the CPU development host. v3 retains v2's single-device accumulation context;
+checkpointing does not resolve its known FSDP deferred-backward incompatibility.
+
 ## Run
 
 ```bash
@@ -345,7 +426,7 @@ separate curves when implementation names are the same but source files differ.
 Run the CPU accumulation checks from the repo root:
 
 ```bash
-python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2
+python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2 scripts.profile.test_pc_v3
 ```
 
 These compare accumulated parameter/gamma/input gradients against a full batch,
