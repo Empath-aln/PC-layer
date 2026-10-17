@@ -19,7 +19,8 @@ weight, and gamma gradients. `--layers` can stack multiple MLP blocks.
 - `pc_v1`: one PC transform and one PC backward per accumulated step; see below.
 - `pc_v2`: v1's accumulation plus CUDA fusion and a smaller backward saved set.
 - `pc_v3`: v2 with selectable PC checkpointing (`none`, `polynomial`, `full`).
-- `pc_v4`, etc.: future versions, each in its own `pc_*.py` file here.
+- `pc_v4`: v3's checkpoint modes with shared PC backward inside the normal FSDP2 graph.
+- `pc_v5`, etc.: future versions, each in its own `pc_*.py` file here.
 
 `pc_baseline.py` is a byte-for-byte snapshot of
 `torchtitan/pc_layer/pc_layer.py` at commit
@@ -31,10 +32,10 @@ snapshot directly, so changing the training operator will not change the referen
 Version files are discovered automatically, without editing a registry:
 
 ```bash
-cp scripts/profile/pc_v3.py scripts/profile/pc_v4.py
-# Edit pc_v4.py to implement the next optimization.
+cp scripts/profile/pc_v4.py scripts/profile/pc_v5.py
+# Edit pc_v5.py to implement the next optimization.
 python scripts/profile/benchmark_mlp.py \
-  --implementation pc_baseline pc_v3 pc_v4 --dim 512 1024 --tokens 256 \
+  --implementation pc_baseline pc_v4 pc_v5 --dim 512 1024 --tokens 256 \
   --grad-accum-steps 4 --seeds 0 1 2 \
   --output outputs/pc_profile/versions.csv
 python scripts/profile/plot_mlp.py outputs/pc_profile/versions.csv \
@@ -284,6 +285,69 @@ they skip locally without CUDA. Actual H200 timing/peak memory is not measured
 on the CPU development host. v3 retains v2's single-device accumulation context;
 checkpointing does not resolve its known FSDP deferred-backward incompatibility.
 
+### v4: FSDP2-compatible PC accumulation
+
+`pc_v4.py` preserves v3's three checkpoint modes and independent operator code.
+For G > 1, it caches only detached PC values and their accumulated output
+gradient. Each microbatch attaches those values to its current W/norm/gamma
+through a new custom autograd node. On the last microbatch, that node returns
+the accumulated PC VJP during the ordinary `loss.backward()`, while FSDP has
+unsharded the parameters. Early microbatches still compute their input gradients;
+PC parameter gradients arrive on the last backward. The cached SN value has a
+small custom derivative attached to the current weight as well. No old full
+parameter, differentiable PC graph, or external backward survives between
+microbatches. Context exit validates completion and clears caches.
+
+This fixes the old context-exit backward accessing full parameter storage that
+FSDP had already freed. Historical v1/v2/v3 files remain unchanged, including
+that limitation. Outside the step context, or at G=1, v4 uses the ordinary
+operator path. Every used PCLinear must participate once per microbatch; W,
+gamma, and SN buffers stay fixed until the context exits. Entirely frozen PC
+parameters still support input gradients.
+
+The training integration is selected through the existing model configuration:
+
+```toml
+[model]
+pc_implementation = "pc_v4"
+pc_checkpoint = "full"  # none / polynomial / full
+
+[training]
+grad_accumulation_steps = 4
+compile = false
+
+[activation_checkpoint]
+mode = "full"  # or none; selective also works with selective_ac_option = "2"
+```
+
+Keep the existing `precondition_*`, `pc_level`, normalization, gamma, optimizer,
+and FSDP settings. CLI equivalents are `--model.pc_implementation pc_v4` and
+`--model.pc_checkpoint full`. The model factory preserves parameter/checkpoint
+names, and the training loop adds one context around the existing microbatch
+loop. Clipping, optimizer updates, and SN updates run after that context. The
+default `baseline` backend preserves existing training behavior. A custom loop
+can use the same plugin:
+
+```python
+from torchtitan.pc_layer.runtime import accumulation_context, update_model_sn_state
+
+optimizer.zero_grad(set_to_none=True)
+with accumulation_context(model, grad_accum_steps):
+    for batch in microbatches:  # exactly grad_accum_steps batches
+        (compute_loss(model, batch) / grad_accum_steps).backward()
+# Optional clipping here; all parameter gradients are ready.
+optimizer.step()
+update_model_sn_state(model)
+```
+
+Supported scope is eager, first-order, pure FSDP2 data parallelism and
+non-reentrant full or layer-selective activation checkpointing. TP, PP,
+`torch.compile`, and operation-selective activation checkpointing are rejected
+in the training setup. DDP/higher-order gradients are not integrated. Single
+device profiling needs no extra setup. To add v4 to old measurements, use the
+incremental commands below with `--implementation pc_v4`; all three PC
+checkpoint modes can be swept, without timing older versions again.
+
 ## Run
 
 ```bash
@@ -522,7 +586,7 @@ separate curves when implementation names are the same but source files differ.
 Run the CPU accumulation checks from the repo root:
 
 ```bash
-python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2 scripts.profile.test_pc_v3 scripts.profile.test_profile_results
+python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2 scripts.profile.test_pc_v3 scripts.profile.test_pc_v4 scripts.profile.test_profile_results
 ```
 
 These compare accumulated parameter/gamma/input gradients against a full batch,
@@ -534,3 +598,78 @@ cleanup on failure, and ensure deferred backward stays inside the timed region.
 The v2 tests check tall/wide/square VJPs, double-precision finite differences,
 gamma edge cases, distinct microbatches and changing weights, saved storage, and
 GEMM counts. Its two CUDA tests skip on hosts without CUDA/Triton.
+
+The full local suite passes on PyTorch 2.14.0 (53 CPU tests; five CUDA tests
+skipped). The v4 suite also passes on PyTorch 2.7.0. Running the historical suite
+on this 2.7 CPU build reproduces an existing v1 BF16/G=3 gradient-gate failure
+(max absolute error 0.00286865, above the unchanged atol=0.002); it also fails
+from the committed snapshot before the FSDP changes. Historical code and
+correctness tolerances are preserved.
+
+## Two-process CPU FSDP2 checks
+
+Run real FSDP2 with two CPU processes and Gloo, without GPUs:
+
+```bash
+python scripts/profile/check_fsdp_cpu.py \
+  --implementation plain pc_baseline pc_v4 \
+  --grad-accum-steps 1 3 --seeds 0 1 --with-plain-head --clip-grad 0.1
+```
+
+The checker uses FP32 master parameters and a small two-block MLP. It matches the repo's FSDP
+wrapping: shard each block, reshard the first after forward, retain the last
+after forward, and shard the root. Each rank gets distinct microbatches. The
+unsharded reference uses ordinary Linear for `plain`, or the frozen PC baseline
+for PC versions, and averages the data from both ranks. The checks compare
+outputs, loss, input gradients, reconstructed full parameter/gamma gradients,
+and parameters after two SGD steps. They also compare updated SN buffers with
+the reference and across ranks, and verify that accumulation caches are cleared.
+`--with-plain-head` includes ordinary parameters and bias alongside PC, so the
+check also catches incomplete reductions in a mixed model. `--clip-grad 0.1`
+checks global gradient clipping before the optimizer update.
+
+Exercise all PC checkpoint modes together with BF16 forward parameters,
+activation recomputation, and synchronization only on the final microbatch:
+
+```bash
+python scripts/profile/check_fsdp_cpu.py \
+  --implementation pc_v4 --pc-checkpoint none polynomial full \
+  --grad-accum-steps 3 --seeds 0 1 \
+  --activation-checkpoint none full selective --mixed-precision bfloat16 \
+  --gradient-sync final --no-input-grad --with-plain-head --clip-grad 0.1
+```
+
+BF16 uses FP32 master parameters and FP32 reduction by default; the unsharded
+reference also casts its forward parameters to BF16. `--input-grad` is on by
+default. The second command checks that FSDP's backward hooks still run when
+the model inputs need no gradients (as with integer token inputs in training).
+
+Each case runs in fresh processes with a timeout. A native worker crash is
+reported as a failed case and does not stop the remaining cases. The JSON report
+includes version hashes, per-rank results, the last recorded stage before a
+crash, and available tracebacks. Its default path is a timestamped file under
+`outputs/pc_profile/`; `--output path.json` chooses a new path. Any failure returns
+exit status 1, including a reproduced incompatibility in an existing version.
+
+On local **PyTorch 2.14.0**, the v4 checks passed with all PC checkpoint modes,
+FP32/BF16, full/layer-selective activation recomputation, both synchronization
+policies, clipping, ordinary parameters, and two distinct seeds. Older v1/v2
+passed at G=1 but crashed during context-exit PC backward at G=3. The checker
+can still select old versions to reproduce failures, without modifying them.
+
+The same tests were also run using an isolated official **PyTorch 2.7.0** wheel.
+On this macOS build, Gloo's native FP32 `reduce_scatter_tensor(..., AVG)` silently
+returns the SUM: a direct collective probe returns 3.0 instead of 1.5, and even
+plain MLP gradients are exactly twice the reference. The JSON records that
+probe. Do not change the training loss or compensate inside the PC operator.
+For this CPU backend, add `--reduce-dtype float64` to either command: it selects
+FSDP's existing SUM + explicit-division path. Both commands passed with that
+option, including BF16 forward/master-parameter updates; this does **not** claim
+native FP32 reduction passed on this 2.7 CPU build. No FSDP internals are patched.
+
+These are CPU correctness and parameter-lifecycle checks. Triton kernels, NCCL,
+GPU overlap, peak memory, and speed still require CUDA validation on the target
+machine; neither CPU reduction configuration substitutes for it. The checker
+uses the older composable FSDP import when the public import is unavailable.
+Local processes communicate through the loopback interface;
+`GLOO_SOCKET_IFNAME` can override that selection.

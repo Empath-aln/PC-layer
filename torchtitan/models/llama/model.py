@@ -19,7 +19,7 @@ from torch.nn.functional import normalize
 import json
 import math
 
-from torchtitan.pc_layer.pc_layer import PCLinear
+from torchtitan.pc_layer.runtime import make_pc_linear, is_pc_linear
 
 
 @dataclass
@@ -49,6 +49,8 @@ class ModelArgs:
     pc_norm_type: Optional[str] = "sn"
     pc_norm_eps: float = 1e-7
     pc_level: int = 0
+    pc_implementation: str = "baseline"
+    pc_checkpoint: str = "full"
 
     recover_w_norm: bool = True
     learnable_gamma: bool = False
@@ -197,10 +199,10 @@ class Attention(nn.Module):
         )
 
         # Wrap nn.Linear with PCLinear (depending on the config)
-        self.wq = PCLinear(wq, model_args, layer_id) if model_args.precondition_qk else wq
-        self.wk = PCLinear(wk, model_args, layer_id) if model_args.precondition_qk else wk
-        self.wv = PCLinear(wv, model_args, layer_id) if model_args.precondition_v else wv
-        self.wo = PCLinear(wo, model_args, layer_id) if model_args.precondition_o else wo
+        self.wq = make_pc_linear(wq, model_args, layer_id) if model_args.precondition_qk else wq
+        self.wk = make_pc_linear(wk, model_args, layer_id) if model_args.precondition_qk else wk
+        self.wv = make_pc_linear(wv, model_args, layer_id) if model_args.precondition_v else wv
+        self.wo = make_pc_linear(wo, model_args, layer_id) if model_args.precondition_o else wo
 
         # Initialize wo weights to zeros
         # with torch.no_grad():
@@ -212,7 +214,7 @@ class Attention(nn.Module):
     def init_weights(self, init_std: float):
         # Get the actual nn.Linear layer (may be a PCLinear or a plain Linear)
         def get_linear(module):
-            if isinstance(module, PCLinear):
+            if is_pc_linear(module):
                 return module.linear
             return module
 
@@ -222,7 +224,7 @@ class Attention(nn.Module):
 
         # Initialize gamma parameters in PCLinear
         for linear in (self.wq, self.wk, self.wv, self.wo):
-            if isinstance(linear, PCLinear):
+            if is_pc_linear(linear):
                 linear._maybe_init_gamma()
 
 
@@ -318,9 +320,9 @@ class FeedForward(nn.Module):
         w3 = nn.Linear(dim, hidden_dim, bias=False)
 
         # Wrap nn.Linear with PCLinear (depending on the config)
-        self.w1 = PCLinear(w1, model_args, layer_id) if model_args.precondition_ffn else w1
-        self.w2 = PCLinear(w2, model_args, layer_id) if model_args.precondition_ffn else w2
-        self.w3 = PCLinear(w3, model_args, layer_id) if model_args.precondition_ffn else w3
+        self.w1 = make_pc_linear(w1, model_args, layer_id) if model_args.precondition_ffn else w1
+        self.w2 = make_pc_linear(w2, model_args, layer_id) if model_args.precondition_ffn else w2
+        self.w3 = make_pc_linear(w3, model_args, layer_id) if model_args.precondition_ffn else w3
 
         # Initialize w3 weights to zeros
         # with torch.no_grad():
@@ -339,7 +341,7 @@ class FeedForward(nn.Module):
     def init_weights(self, init_std: float):
         # Get the actual nn.Linear layer (may be a PCLinear or a plain Linear)
         def get_linear(module):
-            if isinstance(module, PCLinear):
+            if is_pc_linear(module):
                 return module.linear
             return module
 
@@ -349,7 +351,7 @@ class FeedForward(nn.Module):
 
         # Initialize gamma parameters in PCLinear
         for linear in (self.w1, self.w2, self.w3):
-            if isinstance(linear, PCLinear):
+            if is_pc_linear(linear):
                 linear._maybe_init_gamma()
 
 

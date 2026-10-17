@@ -495,6 +495,15 @@ def parallelize_llama(model, world_mesh, parallel_dims, job_config: JobConfig):
     the model must fit on GPU or CPU memory.
     """
 
+    if any(getattr(type(module), "_pc_backend", None) == "pc_v4" for module in model.modules()):
+        if parallel_dims.tp_enabled or parallel_dims.pp_enabled:
+            raise NotImplementedError("pc_v4 currently supports data parallelism/FSDP2, without TP or PP")
+        if job_config.training.compile:
+            raise NotImplementedError("pc_v4 accumulation currently requires eager autograd; disable training.compile")
+        if (job_config.activation_checkpoint.mode == "selective"
+                and job_config.activation_checkpoint.selective_ac_option == "op"):
+            raise NotImplementedError("pc_v4 supports full or layer-selective activation checkpointing, not op-selective")
+
     if parallel_dims.tp_enabled:
         model = apply_tp(model, world_mesh, parallel_dims, job_config)
 

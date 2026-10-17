@@ -514,6 +514,16 @@ class JobConfig:
             """,
         )
 
+        # Optimized PC backend (baseline preserves existing configurations).
+        self.parser.add_argument(
+            "--model.pc_implementation", choices=("baseline", "pc_v4"), default="baseline",
+            help="PC operator implementation; pc_v4 supports shared PC under eager FSDP2",
+        )
+        self.parser.add_argument(
+            "--model.pc_checkpoint", choices=("none", "polynomial", "full"), default="full",
+            help="PC-intermediate recomputation mode for pc_v4",
+        )
+
         # communications library settings
         self.parser.add_argument(
             "--comm.init_timeout_seconds",

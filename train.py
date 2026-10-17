@@ -45,7 +45,8 @@ from torchtitan.parallelisms import (
 from torch.distributed.tensor import DTensor
 from torchtitan.parallelisms.pipelining_utils import build_pipeline_schedule
 from torchtitan.profiling import maybe_enable_memory_snapshot, maybe_enable_profiling
-from torchtitan.pc_layer.pc_layer import (
+from torchtitan.pc_layer.runtime import (
+    accumulation_context as pc_accumulation_context,
     model_uses_sn_norm,
     update_model_sn_state,
 )
@@ -586,6 +587,8 @@ MODEL_CONFIG_KEYS = {
     'pc_norm_type',
     'pc_norm_eps',
     'pc_level',
+    'pc_implementation',
+    'pc_checkpoint',
     'recover_w_norm',
     'learnable_gamma',
     'gamma_init_value',
@@ -946,55 +949,56 @@ def main(job_config: JobConfig):
                 #     # need to free to before bwd to avoid peaking memory
                 #     del pred
                 #     loss.backward()
-                
-                for microbatch_idx in range(job_config.training.grad_accumulation_steps):
 
-                    # get batch
-                    data_load_start = timer()
-                    batch = next(data_iterator)
-                    input_ids, labels = batch
-                    ntokens_since_last_log += labels.numel() * world_size
-                    ntokens_total_train  += labels.numel() * world_size
-                    data_loading_times.append(timer() - data_load_start)
-                    
-                    input_ids = input_ids.cuda()
-                    labels = labels.cuda()
+                with pc_accumulation_context(model, job_config.training.grad_accumulation_steps):
+                    for microbatch_idx in range(job_config.training.grad_accumulation_steps):
 
-                    # model.set_requires_gradient_sync(microbatch_idx==(job_config.training.grad_accumulation_steps-1)) # OOM error
+                        # get batch
+                        data_load_start = timer()
+                        batch = next(data_iterator)
+                        input_ids, labels = batch
+                        ntokens_since_last_log += labels.numel() * world_size
+                        ntokens_total_train  += labels.numel() * world_size
+                        data_loading_times.append(timer() - data_load_start)
 
-                    with loss_parallel_ctx():
-                        # Clear the previous step's records (_buffer is cleared automatically at the start of each forward, but clear output_norms here)
-                        if model_config.log_signal_propagation:
-                            output_norms.clear()
+                        input_ids = input_ids.cuda()
+                        labels = labels.cuda()
 
-                        # print(f" train_state.step {train_state.step}, microbatch_idx: {microbatch_idx}, ntokens_since_last_log {ntokens_since_last_log}, rank {torch.distributed.get_rank()}")
+                        # model.set_requires_gradient_sync(microbatch_idx==(job_config.training.grad_accumulation_steps-1)) # OOM error
 
-                        pred = model(input_ids)
+                        with loss_parallel_ctx():
+                            # Clear the previous step's records (_buffer is cleared automatically at the start of each forward, but clear output_norms here)
+                            if model_config.log_signal_propagation:
+                                output_norms.clear()
 
-                        # Accumulate statistics for the current microbatch
-                        if model_config.log_signal_propagation and output_norms:
-                            for key, value in output_norms.items():
-                                if value is None:
-                                    continue
+                            # print(f" train_state.step {train_state.step}, microbatch_idx: {microbatch_idx}, ntokens_since_last_log {ntokens_since_last_log}, rank {torch.distributed.get_rank()}")
 
-                                # Determine the type by the key name
-                                if '_rms' in key or 'rmsnorm' in key:
-                                    if key not in microbatch_rms_values:
-                                        microbatch_rms_values[key] = []
-                                    microbatch_rms_values[key].append(value)
-                                else:  # absmax type
-                                    if key not in microbatch_absmax_values:
-                                        microbatch_absmax_values[key] = []
-                                    microbatch_absmax_values[key].append(value)
+                            pred = model(input_ids)
 
-                        loss_unnormalized = loss_fn(pred, labels)
-                        del pred
+                            # Accumulate statistics for the current microbatch
+                            if model_config.log_signal_propagation and output_norms:
+                                for key, value in output_norms.items():
+                                    if value is None:
+                                        continue
 
-                        loss = loss_unnormalized / job_config.training.grad_accumulation_steps
+                                    # Determine the type by the key name
+                                    if '_rms' in key or 'rmsnorm' in key:
+                                        if key not in microbatch_rms_values:
+                                            microbatch_rms_values[key] = []
+                                        microbatch_rms_values[key].append(value)
+                                    else:  # absmax type
+                                        if key not in microbatch_absmax_values:
+                                            microbatch_absmax_values[key] = []
+                                        microbatch_absmax_values[key].append(value)
 
-                        losses_since_last_log.append(loss_unnormalized) # need to log the un-normalized loss. It will be normalized later in the log function
-         
-                        loss.backward()
+                            loss_unnormalized = loss_fn(pred, labels)
+                            del pred
+
+                            loss = loss_unnormalized / job_config.training.grad_accumulation_steps
+
+                            losses_since_last_log.append(loss_unnormalized) # need to log the un-normalized loss. It will be normalized later in the log function
+
+                            loss.backward()
 
             # clip gradients
             for model in model_parts:
