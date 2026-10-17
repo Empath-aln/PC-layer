@@ -115,6 +115,9 @@ def check_equivalence(
             compare("output after final SN update", model(x), post_update)
     except torch.cuda.OutOfMemoryError:
         raise
-    except (AssertionError, RuntimeError, ValueError, TypeError, AttributeError) as error:
-        report.update(correctness_status="failed", correctness_error=str(error))
+    except Exception as error:
+        # Version backends may raise their own compiler/launch exception types.
+        # Keep the failed case in the CSV rather than aborting the whole sweep.
+        # OOM is deliberately handled above, and interrupts are not swallowed.
+        report.update(correctness_status="failed", correctness_error=f"{type(error).__name__}: {error}")
     return report, state

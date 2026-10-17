@@ -17,7 +17,8 @@ weight, and gamma gradients. `--layers` can stack multiple MLP blocks.
 - `plain`: ordinary `nn.Linear` MLP, with no PC; not an equivalent PC implementation.
 - `pc_baseline`: the frozen original PC implementation in `pc_baseline.py`.
 - `pc_v1`: one PC transform and one PC backward per accumulated step; see below.
-- `pc_v2`, etc.: future versions, each in its own `pc_*.py` file here.
+- `pc_v2`: v1's accumulation plus CUDA fusion and a smaller backward saved set.
+- `pc_v3`, etc.: future versions, each in its own `pc_*.py` file here.
 
 `pc_baseline.py` is a byte-for-byte snapshot of
 `torchtitan/pc_layer/pc_layer.py` at commit
@@ -29,10 +30,10 @@ snapshot directly, so changing the training operator will not change the referen
 Version files are discovered automatically, without editing a registry:
 
 ```bash
-cp scripts/profile/pc_baseline.py scripts/profile/pc_v2.py
-# Edit pc_v2.py to implement the next optimization.
+cp scripts/profile/pc_v2.py scripts/profile/pc_v3.py
+# Edit pc_v3.py to implement the next optimization.
 python scripts/profile/benchmark_mlp.py \
-  --implementation pc_baseline pc_v2 --dim 512 1024 --tokens 256 \
+  --implementation pc_baseline pc_v2 pc_v3 --dim 512 1024 --tokens 256 \
   --grad-accum-steps 4 --seeds 0 1 2 \
   --output outputs/pc_profile/versions.csv
 python scripts/profile/plot_mlp.py outputs/pc_profile/versions.csv \
@@ -125,6 +126,80 @@ two models there. Performance starts from a fresh model with the checked initial
 state. When an optimized version is requested, `pc_baseline` is automatically
 included for performance comparison. The terminal reports paired-seed speedup
 and mean CUDA peak-memory savings relative to it.
+
+### v2: fusion and backward storage
+
+The v2 operator has its own first-order autograd implementation; no training-loop
+or accumulation-interface changes are required. It keeps v1's shared PC forward
+and backward across microbatches. At accum=1 it also uses the new v2 transform/VJP.
+The SN helpers and accumulation context are copied from v1 unchanged.
+
+For level 4, the manual backward saves the original W, scalar norm/gamma, four
+Gram-size matrices (the Gram matrix plus three Horner results), and the
+pre-gamma output when gamma needs a gradient. It reconstructs normalized W and
+the initial affine polynomial term using pointwise operations. It does **not**
+recompute a GEMM. For trainable W/norm/gamma, level 4 still uses 5 forward GEMMs
+and 10 backward GEMMs. Norm recovery retains its original stop-gradient, and a
+zero gamma still has the correct derivative.
+
+CUDA FP32/BF16 use Triton kernels for:
+
+- Initial affine polynomial construction without an explicit identity matrix.
+- Horner GEMM + diagonal constant addition in one kernel, keeping the
+  intermediate dtype rounding between the two operations in registers.
+- Norm recovery + gamma scaling, reusing the pre-gamma output buffer.
+- Backward scaling/reductions and normalization gradients, avoiding full-size
+  elementwise temporaries.
+
+The Gram GEMM, final rectangular GEMM, and backward GEMMs use PyTorch. The Horner
+kernel currently uses fixed 64x64x32 tiling; performance needs measurement on the
+H200 slice. There is no claim that its GEMMs are faster than cuBLAS. Triton is
+optional for CPU import; CUDA FP32/BF16 require it and fail explicitly if absent.
+The PyTorch 2.7.0 Linux CUDA environment supplies Triton 3.3.0. CPU uses the same
+manual VJP and diagonal/buffer strategy in torch, without CUDA fusion.
+
+A CPU saved-tensor-storage check (excluding original inputs/shared storage)
+reduces the level-4 saved set from two weight-size + five Gram-size tensors to
+one weight-size + four Gram-size tensors. At d=1024, h=4096, BF16 this is about
+26 -> 16 MiB per PCLinear, or 104 -> 64 MiB for two MLP blocks. These are saved
+storage sizes, **not CUDA peak-memory measurements**; backward temporaries and
+cached PC weights/gradients also contribute to the peak. CUDA kernels and actual
+time/peak memory must be validated on the GPU; the local development host has
+no CUDA device.
+
+On the server, validate CUDA kernels before running the multi-seed comparison.
+These tests include padded matrix sizes, multi-block reductions, tall/wide
+weights, zero gamma, output and gradient checks. The benchmark also checks each
+case against the frozen baseline at the existing tolerances before timing it.
+Compiler/backend errors are recorded as failed correctness cases.
+
+~~~bash
+source ./.venv-profile/bin/activate
+python -m unittest scripts.profile.test_pc_v2 -v
+
+PC_V2_OUT="outputs/pc_profile/pc_v2_$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$PC_V2_OUT"
+
+# Width sweep: compare all four versions in the same plot.
+python scripts/profile/benchmark_mlp.py \
+  --device cuda --dtype bfloat16 \
+  --implementation plain pc_baseline pc_v1 pc_v2 \
+  --dim 512 1024 2048 --layers 2 --tokens 512 --grad-accum-steps 4 \
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 \
+  --warmup 10 --steps 50 --output "$PC_V2_OUT/width.csv"
+python scripts/profile/plot_mlp.py "$PC_V2_OUT/width.csv" \
+  --x dim --band std --output "$PC_V2_OUT/width.png"
+
+# Accumulation sweep: verify that v1's reuse remains effective in v2.
+python scripts/profile/benchmark_mlp.py \
+  --device cuda --dtype bfloat16 \
+  --implementation plain pc_baseline pc_v1 pc_v2 \
+  --dim 1024 --layers 2 --tokens 512 --grad-accum-steps 1 2 4 8 \
+  --pc-level 4 --power-iter 10 --seeds 0 1 2 3 4 \
+  --warmup 10 --steps 50 --output "$PC_V2_OUT/accum.csv"
+python scripts/profile/plot_mlp.py "$PC_V2_OUT/accum.csv" \
+  --x grad_accum_steps --log-x --band std --output "$PC_V2_OUT/accum.png"
+~~~
 
 ## Run
 
@@ -270,7 +345,7 @@ separate curves when implementation names are the same but source files differ.
 Run the CPU accumulation checks from the repo root:
 
 ```bash
-python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1
+python -m unittest scripts.profile.test_benchmark_mlp scripts.profile.test_pc_v1 scripts.profile.test_pc_v2
 ```
 
 These compare accumulated parameter/gamma/input gradients against a full batch,
@@ -279,3 +354,6 @@ versions, and reject incorrect outputs, backward gradients, and SN updates.
 The v1 tests also use distinct microbatches, change weights/gamma between steps,
 compare every input gradient, count PC forward/backward calls, verify cache
 cleanup on failure, and ensure deferred backward stays inside the timed region.
+The v2 tests check tall/wide/square VJPs, double-precision finite differences,
+gamma edge cases, distinct microbatches and changing weights, saved storage, and
+GEMM counts. Its two CUDA tests skip on hosts without CUDA/Triton.
